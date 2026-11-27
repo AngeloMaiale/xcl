@@ -161,6 +161,33 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
     }
 }
 
+/// Decode the 15-byte counter-in-register `CLZERO` loop at `b[..15]`:
+/// `mov rax, a; add a, 0x40; clzero; cmp a, b; jb -15` -> `Some((a, b))` (CONTEXT register
+/// indices `0..15`, excluding `rax` for `a`, `rsp` for either, and `a == b`).
+pub fn decode_clzero_loop15(b: &[u8]) -> Option<(u8, u8)> {
+    if b.len() < 15 || b[7..10] != [0x0F, 0x01, 0xFC] || b[13..15] != [0x72, 0xF1] {
+        return None;
+    }
+    let a = if (b[0] == 0x48 || b[0] == 0x4C) && b[1] == 0x89 && (b[2] & 0xC7) == 0xC0 {
+        ((b[2] >> 3) & 7) | ((b[0] & 4) << 1)
+    } else if (b[0] == 0x48 || b[0] == 0x49) && b[1] == 0x8B && (b[2] & 0xF8) == 0xC0 {
+        (b[2] & 7) | ((b[0] & 1) << 3)
+    } else {
+        return None;
+    };
+    if a == 0 || a == 4 || b[3..7] != [0x48 | (a >> 3), 0x83, 0xC0 | (a & 7), 0x40] {
+        return None;
+    }
+    let end = if (b[10] & 0xFA) == 0x48 && (b[10] & 1) == (a >> 3) && b[11] == 0x39 && (b[12] & 0xC7) == (0xC0 | (a & 7)) {
+        ((b[12] >> 3) & 7) | ((b[10] & 4) << 1)
+    } else if (b[10] & 0xFA) == 0x48 && ((b[10] >> 2) & 1) == (a >> 3) && b[11] == 0x3B && (b[12] & 0xF8) == (0xC0 | ((a & 7) << 3)) {
+        (b[12] & 7) | ((b[10] & 1) << 3)
+    } else {
+        return None;
+    };
+    (end != 4 && end != a).then_some((a, end))
+}
+
 /// `code` as hex, for a log line.
 pub fn hex(code: &[u8]) -> String {
     code.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
@@ -234,6 +261,25 @@ mod tests {
             assert_eq!(decode(&code), None, "#UD on the CPU: {code:02x?}");
         }
         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC]), Some((ConsoleOnly::Clzero, 4)));
+        // 15-byte loop: mov rax, r10; add r10, 0x40; clzero; cmp r10, r11; jb -15
+        assert_eq!(
+            decode_clzero_loop15(&[0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1]),
+            Some((10, 11))
+        );
+        // mov rax, rdx; add rdx, 0x40; clzero; cmp rdx, r8; jb -15 (and 8B / 3B encodings)
+        assert_eq!(
+            decode_clzero_loop15(&[0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4C, 0x39, 0xC2, 0x72, 0xF1]),
+            Some((2, 8))
+        );
+        assert_eq!(
+            decode_clzero_loop15(&[0x49, 0x8B, 0xC1, 0x49, 0x83, 0xC1, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x3B, 0xCA, 0x72, 0xF1]),
+            Some((9, 10))
+        );
+        // rejected: counter in rax / rsp, end in rsp, or counter == end
+        assert_eq!(decode_clzero_loop15(&[0x48, 0x89, 0xC0, 0x48, 0x83, 0xC0, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xD0, 0x72, 0xF1]), None);
+        assert_eq!(decode_clzero_loop15(&[0x48, 0x89, 0xE0, 0x48, 0x83, 0xC4, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xD4, 0x72, 0xF1]), None);
+        assert_eq!(decode_clzero_loop15(&[0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xE2, 0x72, 0xF1]), None);
+        assert_eq!(decode_clzero_loop15(&[0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xD2, 0x72, 0xF1]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x38]), None);
         assert_eq!(decode(&[0x0F, 0xAE, 0x30]), None);
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);

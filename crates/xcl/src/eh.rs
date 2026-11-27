@@ -212,6 +212,47 @@ fn clzero_loop_thunk(end_reg: u8) -> Vec<u8> {
     c
 }
 
+/// Stand-in for the 15-byte `mov rax, a; add a, 0x40; clzero; cmp a, b; jb -15` loop: zeroes
+/// `[a & !63 .. )` in whole 64-byte lines up to `b` (at least one line), advances `a` by `N * 64`,
+/// leaves `rax` at `a - 64` (the address passed to the last `clzero`), sets flags from `cmp a, b`,
+/// and preserves every other register.
+fn clzero_loop15_thunk(cnt_reg: u8, end_reg: u8) -> Vec<u8> {
+    let (a, b) = (cnt_reg & 15, end_reg & 15);
+    let mut c: Vec<u8> = vec![0x57, 0x51]; // push rdi; push rcx
+    c.extend_from_slice(&[0x48 | (b >> 3), 0x8B, 0xC8 | (b & 7)]); // mov rcx, <b_reg>
+    if a == 1 {
+        c.extend_from_slice(&[0x48, 0x8B, 0x04, 0x24]); // mov rax, [rsp] (caller's rcx)
+    } else {
+        c.extend_from_slice(&[0x48 | (a >> 3), 0x8B, 0xC0 | (a & 7)]); // mov rax, <a_reg>
+    }
+    c.extend_from_slice(&[0x48, 0x89, 0xC7]); // mov rdi, rax
+    c.extend_from_slice(&[0x48, 0x83, 0xE7, 0xC0]); // and rdi, -64
+    c.extend_from_slice(&[0x48, 0x29, 0xC1]); // sub rcx, rax
+    c.extend_from_slice(&[0x76, 0x0C]); // jbe one
+    c.extend_from_slice(&[0x48, 0xFF, 0xC9]); // dec rcx
+    c.extend_from_slice(&[0x48, 0xC1, 0xE9, 0x06]); // shr rcx, 6
+    c.extend_from_slice(&[0x48, 0xFF, 0xC1]); // inc rcx
+    c.extend_from_slice(&[0xEB, 0x05]); // jmp go
+    c.extend_from_slice(&[0xB9, 0x01, 0x00, 0x00, 0x00]); // one: mov ecx, 1
+    c.extend_from_slice(&[0x48, 0xC1, 0xE1, 0x06]); // go: shl rcx, 6
+    c.extend_from_slice(&[0x48, 0x01, 0xC8]); // add rax, rcx (final a)
+    if a == 1 {
+        c.extend_from_slice(&[0x48, 0x89, 0x04, 0x24]); // mov [rsp], rax
+    } else if a == 7 {
+        c.extend_from_slice(&[0x48, 0x89, 0x44, 0x24, 0x08]); // mov [rsp + 8], rax
+    } else {
+        c.extend_from_slice(&[0x48 | (a >> 3), 0x89, 0xC0 | (a & 7)]); // mov <a_reg>, rax
+    }
+    c.extend_from_slice(&[0x48, 0x83, 0xE8, 0x40]); // sub rax, 0x40 (final rax)
+    c.push(0x50); // push rax
+    c.extend_from_slice(&[0x31, 0xC0]); // xor eax, eax
+    c.extend_from_slice(&[0xF3, 0xAA]); // rep stosb
+    c.extend_from_slice(&[0x58, 0x59, 0x5F]); // pop rax; pop rcx; pop rdi
+    c.extend_from_slice(&[0x48 | ((b >> 3) << 2) | (a >> 3), 0x39, 0xC0 | ((b & 7) << 3) | (a & 7)]); // cmp <a_reg>, <b_reg>
+    c.push(0xC3); // ret
+    c
+}
+
 /// Executable memory a `call rel32` at `site` reaches (64 KiB, committed), made in the first free
 /// place above it. None: none within 1 GiB.
 unsafe fn code_near(site: usize) -> Option<usize> {
@@ -227,13 +268,20 @@ unsafe fn code_near(site: usize) -> Option<usize> {
     None
 }
 
-/// Executable memory `[at, at + len)` of a title image on a CPU without CLZERO: each
-/// `clzero; add rax, 0x40; cmp rax, <reg>; jb` loop (`insn::ConsoleOnly::ClzeroLoop`, 12 bytes)
-/// becomes a call of a stand-in that zeroes the same lines (`clzero_loop_thunk`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ClzeroLoopKind {
+    Loop12(u8),
+    Loop15(u8, u8),
+}
+
+/// Executable memory `[at, at + len)` of a title image on a CPU without CLZERO: each 12-byte
+/// `clzero; add rax, 0x40; cmp rax, <reg>; jb` loop (`insn::ConsoleOnly::ClzeroLoop`) or 15-byte
+/// `mov rax, a; add a, 0x40; clzero; cmp a, b; jb` loop (`insn::decode_clzero_loop15`) becomes a
+/// call of a stand-in that zeroes the same lines (`clzero_loop_thunk` / `clzero_loop15_thunk`).
 /// `XCL_CLZERO_PATCH=0` leaves the loops as they are. The patched loops.
 ///
 /// Left alone, every run of such a loop is an illegal-instruction exception that
-/// `emulate_console_only` answers: a retail title's memset is such a loop, and while its world
+/// `emulate_console_only` answers: a retail title's memset has both shapes, and while its world
 /// loaded one of its threads was in that exception at every look (thread dumps at 300, 360 and
 /// 400 s of several runs on an Intel CPU), with the GPU measured at 0.2 to 0.5 s of work in world
 /// frames of 17 to 43 s.
@@ -243,14 +291,29 @@ pub unsafe fn patch_clzero_loops(at: usize, len: usize, image: &str) -> usize {
         return 0;
     }
     let code = std::slice::from_raw_parts(at as *const u8, len);
-    let sites: Vec<(usize, u8)> = (0..len - 11)
-        .filter(|&i| code[i] == 0x0F && code[i + 1] == 0x01 && code[i + 2] == 0xFC && (i == 0 || code[i - 1] != 0x67))
-        .filter_map(|i| match crate::insn::decode(&code[i..i + 12]) {
+    let mut sites: Vec<(usize, ClzeroLoopKind)> = Vec::new();
+    let mut patched_until = 0usize;
+    for i in 0..len - 2 {
+        if code[i] != 0x0F || code[i + 1] != 0x01 || code[i + 2] != 0xFC || (i > 0 && code[i - 1] == 0x67) {
+            continue;
+        }
+        if i + 12 <= len && i >= patched_until {
             // (rsp is no end of a loop: the stand-in's pushes move it)
-            Some((crate::insn::ConsoleOnly::ClzeroLoop { end_reg }, 12)) if end_reg != 4 => Some((i, end_reg)),
-            _ => None,
-        })
-        .collect();
+            if let Some((crate::insn::ConsoleOnly::ClzeroLoop { end_reg }, 12)) = crate::insn::decode(&code[i..i + 12]) {
+                if end_reg != 4 {
+                    sites.push((i, ClzeroLoopKind::Loop12(end_reg)));
+                    patched_until = i + 12;
+                    continue;
+                }
+            }
+        }
+        if i >= 7 && i + 8 <= len && i - 7 >= patched_until {
+            if let Some((cnt, end)) = crate::insn::decode_clzero_loop15(&code[i - 7..i + 8]) {
+                sites.push((i - 7, ClzeroLoopKind::Loop15(cnt, end)));
+                patched_until = i + 8;
+            }
+        }
+    }
     if sites.is_empty() {
         return 0;
     }
@@ -258,27 +321,47 @@ pub unsafe fn patch_clzero_loops(at: usize, len: usize, image: &str) -> usize {
         crate::xlog_warn!("{image}: {} CLZERO loops stay emulated (no executable memory near the image)", sites.len());
         return 0;
     };
-    // one stand-in for each end register
-    let mut thunks = [0usize; 16];
+    let mut thunks: std::collections::HashMap<ClzeroLoopKind, usize> = std::collections::HashMap::new();
     let mut next = arena;
     let mut done = 0;
-    for &(i, reg) in &sites {
-        if thunks[reg as usize] == 0 {
-            let t = clzero_loop_thunk(reg);
-            std::ptr::copy_nonoverlapping(t.as_ptr(), next as *mut u8, t.len());
-            thunks[reg as usize] = next;
-            next += (t.len() + 15) & !15;
-        }
-        let site = at + i;
-        let Ok(rel) = i32::try_from(thunks[reg as usize] as i64 - (site as i64 + 5)) else { continue };
-        let mut patch = [0xE8u8, 0, 0, 0, 0, 0x0F, 0x1F, 0x80, 0, 0, 0, 0]; // call thunk; nop (7 bytes)
+    for &(off, kind) in &sites {
+        let thunk = match thunks.get(&kind).copied() {
+            Some(addr) => addr,
+            None => {
+                let t = match kind {
+                    ClzeroLoopKind::Loop12(reg) => clzero_loop_thunk(reg),
+                    ClzeroLoopKind::Loop15(cnt, end) => clzero_loop15_thunk(cnt, end),
+                };
+                if next - arena + t.len() > 0x1_0000 {
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(t.as_ptr(), next as *mut u8, t.len());
+                let addr = next;
+                thunks.insert(kind, addr);
+                next += (t.len() + 15) & !15;
+                addr
+            }
+        };
+        let site = at + off;
+        let Ok(rel) = i32::try_from(thunk as i64 - (site as i64 + 5)) else { continue };
+        let mut patch = [
+            0xE8u8, 0, 0, 0, 0,
+            0x66, 0x2E, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, // 10-byte nop (15-byte form)
+        ];
+        let patch_len = match kind {
+            ClzeroLoopKind::Loop12(_) => {
+                patch[5..12].copy_from_slice(&[0x0F, 0x1F, 0x80, 0, 0, 0, 0]); // 7-byte nop
+                12
+            }
+            ClzeroLoopKind::Loop15(_, _) => 15,
+        };
         patch[1..5].copy_from_slice(&rel.to_le_bytes());
         let mut old = 0u32;
-        if VirtualProtect(site as *const std::ffi::c_void, 12, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+        if VirtualProtect(site as *const std::ffi::c_void, patch_len, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
             continue;
         }
-        std::ptr::copy_nonoverlapping(patch.as_ptr(), site as *mut u8, 12);
-        VirtualProtect(site as *const std::ffi::c_void, 12, old, &mut old);
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), site as *mut u8, patch_len);
+        VirtualProtect(site as *const std::ffi::c_void, patch_len, old, &mut old);
         done += 1;
     }
     if done != 0 {
@@ -1188,6 +1271,83 @@ mod tests {
             let (rax, _, _, _) = run(base + 64 * 2, base + 64);
             assert_eq!(rax, base + 64 * 3);
             assert!(m.0[..64 * 2].iter().all(|&b| b == 0xEE) && m.0[64 * 2..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xEE));
+        }
+    }
+
+    /// A patched 15-byte `mov rax, a; add a, 0x40; clzero; cmp a, b; jb -15` loop zeroes whole
+    /// lines, advances `a` by `N * 64`, leaves `rax` at `a - 64`, sets `cmp a, b` flags, and
+    /// preserves every other register (including when `a` or `b` uses `rcx` / `rdi`).
+    #[test]
+    fn a_patched_15_byte_clzero_loop_zeroes_lines_and_keeps_counter_rax_and_flags() {
+        unsafe {
+            // 1) (a = r10, b = r11): mov rax, r10; add r10, 0x40; clzero; cmp r10, r11; jb -15; setb dl; sete dh; ret
+            let code = crate::stubs::alloc_code(128);
+            let b1 = [
+                0x4Cu8, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40, 0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1,
+                0x0F, 0x92, 0xC2, 0x0F, 0x94, 0xC6, 0xC3,
+            ];
+            std::ptr::copy_nonoverlapping(b1.as_ptr(), code, b1.len());
+            assert_eq!(patch_clzero_loops(code as usize, b1.len(), "test15"), 1);
+            assert_eq!(*code, 0xE8, "call at loop top");
+            let run_r10 = |start: usize, end: usize| -> (usize, usize, usize, usize, usize, usize) {
+                let (rax, r10, r11, rcx, rdi, rdx): (usize, usize, usize, usize, usize, usize);
+                std::arch::asm!(
+                    "call {f}",
+                    f = in(reg) code,
+                    inout("rax") 0xDEAD_BEEFusize => rax,
+                    inout("r10") start => r10,
+                    inout("r11") end => r11,
+                    inout("rcx") 0xCC00usize => rcx,
+                    inout("rdi") 0xDD00usize => rdi,
+                    inout("rdx") 0xEE00_0000usize => rdx,
+                );
+                (rax, r10, r11, rcx, rdi, rdx)
+            };
+            #[repr(align(64))]
+            struct Lines([u8; 64 * 6]);
+            let mut m = Lines([0xAA; 64 * 6]);
+            let base = m.0.as_mut_ptr() as usize;
+
+            // Exact end after 2 passes: lines 1..3 zeroed, r10 == end, rax == r10 - 64, CF=0, ZF=1
+            let (rax, r10, r11, rcx, rdi, rdx) = run_r10(base + 64 + 8, base + 64 * 3 + 8);
+            assert_eq!((r10, rax, r11), (base + 64 * 3 + 8, base + 64 * 2 + 8, base + 64 * 3 + 8));
+            assert_eq!((rcx, rdi, rdx & 0xFFFF), (0xCC00, 0xDD00, 0x0100), "CF=0 (dl=0), ZF=1 (dh=1)");
+            assert!(m.0[..64].iter().all(|&b| b == 0xAA) && m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xAA));
+
+            // Non-multiple (65 B -> 2 passes): r10 == start + 128 > end, rax == r10 - 64, CF=0, ZF=0
+            m.0.fill(0xAA);
+            let (rax, r10, _, _, _, rdx) = run_r10(base + 64 + 8, base + 64 * 2 + 9);
+            assert_eq!((r10, rax, rdx & 0xFFFF), (base + 64 * 3 + 8, base + 64 * 2 + 8, 0));
+            assert!(m.0[..64].iter().all(|&b| b == 0xAA) && m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xAA));
+
+            // end <= start: one line zeroed, r10 == start + 64, rax == start, CF=0, ZF=0
+            m.0.fill(0xAA);
+            let (rax, r10, _, _, _, rdx) = run_r10(base + 64 * 2 + 5, base + 64);
+            assert_eq!((r10, rax, rdx & 0xFFFF), (base + 64 * 3 + 5, base + 64 * 2 + 5, 0));
+            assert!(m.0[..64 * 2].iter().all(|&b| b == 0xAA) && m.0[64 * 2..64 * 3].iter().all(|&b| b == 0) && m.0[64 * 3..].iter().all(|&b| b == 0xAA));
+
+            // 2) Scratch-register aliasing: (a = rcx, b = rdi) and (a = rdi, b = rcx) in one image
+            let code2 = code.add(32);
+            let b2 = [
+                // +0: mov rax, rcx; add rcx, 0x40; clzero; cmp rcx, rdi; jb -15; ret
+                0x48u8, 0x89, 0xC8, 0x48, 0x83, 0xC1, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xF9, 0x72, 0xF1, 0xC3,
+                // +16: mov rax, rdi; add rdi, 0x40; clzero; cmp rdi, rcx; jb -15; ret
+                0x48, 0x89, 0xF8, 0x48, 0x83, 0xC7, 0x40, 0x0F, 0x01, 0xFC, 0x48, 0x39, 0xCF, 0x72, 0xF1, 0xC3,
+            ];
+            std::ptr::copy_nonoverlapping(b2.as_ptr(), code2, b2.len());
+            assert_eq!(patch_clzero_loops(code2 as usize, b2.len(), "test15_alias"), 2);
+
+            m.0.fill(0xAA);
+            let (rax, rcx, rdi): (usize, usize, usize);
+            std::arch::asm!("call {f}", f = in(reg) code2, out("rax") rax, inout("rcx") base + 64 => rcx, inout("rdi") base + 64 * 3 => rdi);
+            assert_eq!((rcx, rax, rdi), (base + 64 * 3, base + 64 * 2, base + 64 * 3));
+            assert!(m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[..64].iter().all(|&b| b == 0xAA));
+
+            m.0.fill(0xAA);
+            let (rax, rdi, rcx): (usize, usize, usize);
+            std::arch::asm!("call {f}", f = in(reg) code2.add(16), out("rax") rax, inout("rdi") base + 64 => rdi, inout("rcx") base + 64 * 3 => rcx);
+            assert_eq!((rdi, rax, rcx), (base + 64 * 3, base + 64 * 2, base + 64 * 3));
+            assert!(m.0[64..64 * 3].iter().all(|&b| b == 0) && m.0[..64].iter().all(|&b| b == 0xAA));
         }
     }
 
